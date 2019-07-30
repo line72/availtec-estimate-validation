@@ -6,7 +6,7 @@ generates pretty graphs to validate the estimation.
 
 These scripts work with any bus system based on the Availtec.com
 platform, for example:
-(Birmingham, AL's)[https://realtimebjcta.availtec.com/InfoPoint/].
+[Birmingham, AL's](https://realtimebjcta.availtec.com/InfoPoint/).
 
 ![Screenshot](/screenshot.png?raw=true "Estimation Accuracy of Bus Arrivals")
 
@@ -35,8 +35,8 @@ You will need to edit the `config.py` and configure both the `URL` and
 the `stops` list. Each stop needs to have:
 
 - `id`: This is the stop's id in Availtec's system. You can go to the
-  agency's (Real Time
-  system)[https://realtimebjcta.availtec.com/InfoPoint/] and search
+  agency's
+  [Real Time system](https://realtimebjcta.availtec.com/InfoPoint/) and search
   for the stops by name to get an id. Every bus / route that stops at
   this stop will be recorded.
 - `description`: A human readable name for this stop that show up in
