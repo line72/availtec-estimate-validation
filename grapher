@@ -43,7 +43,7 @@ def go(args):
     date = args.date if args.date else datetime.date.today().strftime('%Y-%m-%d')
     
     # only get results from today
-    cursor.execute("SELECT * FROM stop_routes WHERE actual IS NOT NULL AND date=date(?) ORDER BY NAME, id", (date,))
+    cursor.execute("SELECT * FROM stop_routes WHERE actual IS NOT NULL AND date=date(?) ORDER BY NAME, route_id, actual, id", (date,))
     stop_routes = cursor.fetchall()
 
     # filter or include based on command line args
