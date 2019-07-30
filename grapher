@@ -1,0 +1,181 @@
+#!/usr/bin/env python3
+
+##################################################
+# availtec-estimate-validation
+# (c) Marcus Dillavou <line72@line72.net
+#  https://github.com/line72/availtec-estimate-validation
+##################################################
+
+# MIT License
+#
+# Copyright (c) 2019 Marcus Dillavou <line72@line72.net>
+# https://github.com/line72/availtec-estimate-validation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+import sys
+import argparse
+import sqlite3
+import datetime
+import matplotlib.pyplot
+
+def go(args):
+    conn = sqlite3.connect('availtec-times.db')
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    date = args.date if args.date else datetime.date.today().strftime('%Y-%m-%d')
+    
+    # only get results from today
+    cursor.execute("SELECT * FROM stop_routes WHERE actual IS NOT NULL AND date=date(?) ORDER BY NAME, id", (date,))
+    stop_routes = cursor.fetchall()
+
+    # filter or include based on command line args
+    if args.include_stops:
+        stop_routes = list(filter(lambda x: x['stop_id'] in args.include_stops, stop_routes))
+    if args.exclude_stops:
+        stop_routes = list(filter(lambda x: x['stop_id'] not in args.exclude_stops, stop_routes))
+        
+    if args.include_routes:
+        stop_routes = list(filter(lambda x: x['route_id'] in args.include_routes, stop_routes))
+    if args.exclude_routes:
+        stop_routes = list(filter(lambda x: x['route_id'] not in args.exclude_routes, stop_routes))
+
+    if len(stop_routes) <= 1:
+        print('Nothing to graph!', file = sys.stderr)
+        sys.exit(1)
+
+    height_ratios, span = get_height_ratios(cursor, stop_routes)
+
+    # dynamically set the height based on the height of each subplot
+    # Use the total seconds in the span to decide the height
+    plot_height = sum(height_ratios) * (span.total_seconds() / 60 / 2)
+    fig, plts = matplotlib.pyplot.subplots(len(stop_routes), 1, sharex = False, sharey = False,
+                                           constrained_layout = True,
+                                           gridspec_kw = {'height_ratios': height_ratios},
+                                           figsize = (20, plot_height))
+    #fig.suptitle('Arrival Estimates', fontsize=64)
+
+    formatter = matplotlib.dates.DateFormatter('%H:%M:%S', tz = datetime.timezone(-datetime.timedelta(hours=5)))
+    
+    for i, stop_route in enumerate(stop_routes):
+        cursor.execute("SELECT * FROM estimates WHERE stop_route_id=? ORDER by id", (stop_route['id'],))
+        estimates = cursor.fetchall()
+
+        ##
+        # Timezones!!
+        #
+        # In the stop_routes table, the `actual` field does NOT have an explicit timezone set,
+        #  but it is in UTC.
+        # In the estimates table, the `datetime` field does NOT have an explicit timezone set,
+        #  but it is in UTC.
+        # In the estimates table, the `estimate` field DOES have a timezone set.
+        #
+        # For the `actual` and `datetime` fields, after we parse it, we explicitly need to set the
+        #  timezone to UTC, so that it will match the estimate.
+        
+        xs = [datetime.datetime.fromisoformat(x['datetime']).replace(tzinfo = datetime.timezone.utc) for x in estimates]
+        ys = [datetime.datetime.fromisoformat(x['estimate']) for x in estimates]
+
+        min_x = min(xs)
+        max_x = max(xs)
+
+        actual = datetime.datetime.fromisoformat(stop_route['actual']).replace(tzinfo = datetime.timezone.utc)
+
+        # make a title
+        title = f'#{stop_route["route_id"]} (Trip: {stop_route["trip_id"]}) {stop_route["name"]}'
+        plts[i].set_title(title, loc = 'left')
+
+        # set the date formatter
+        plts[i].xaxis.set_major_formatter(formatter)
+        plts[i].yaxis.set_major_formatter(formatter)
+        
+        # draw a dark black lin at th actual time
+        plts[i].plot([min_x, max_x], [actual, actual], 'k', linewidth = 4.0, zorder = 100)
+
+        plts[i].plot(xs, ys, linewidth = 3.0)
+        # fill it
+        plts[i].fill_between(xs, ys, [actual], alpha = 0.3)
+
+        # explicitely set the y-ticks
+        min_y = min(ys)
+        max_y = max(ys)
+        yticks = [min_y, actual, max_y]
+        plts[i].yaxis.set_ticks(yticks)
+
+    filename = args.filename or 'output.pdf'
+    matplotlib.pyplot.savefig(filename)
+
+def get_height_ratios(cursor, stop_routes):
+    '''
+    Find the min-y/max-y of each subplot, then change the size
+    of each subplot so a 1-minute tick mark is the same in each plot.
+    This will cause each plot to be a different height.
+    '''
+    
+    all_y = []
+    max_span = None
+    for stop_route in stop_routes:
+        cursor.execute("SELECT estimate FROM estimates WHERE stop_route_id=? ORDER by stop_route_id, id", (stop_route['id'],))
+        estimates = cursor.fetchall()
+
+        ys = [datetime.datetime.fromisoformat(x['estimate']) for x in estimates]
+
+        # include the actual in the estimates
+        actual = datetime.datetime.fromisoformat(stop_route['actual']).replace(tzinfo = datetime.timezone.utc)
+        ys.append(actual)
+
+        min_y0 = min(ys)
+        max_y0 = max(ys)
+        
+        all_y.append((min_y0, max_y0))
+
+        span = max_y0 - min_y0
+        if max_span is None or span > max_span:
+            max_span = span
+
+    # calculate the ratio for each plot. If the ratio is too small
+    #  then cap it at 0.1.
+    ratios = [x if x > 0.01 else 0.01 for x in [((m1 - m0) / max_span) for (m0, m1) in all_y]]
+
+    return (ratios, max_span)
+    
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description = 'Graph the Departure Estimates')
+    parser.add_argument('-s', '--include-stop',
+                        help = 'Only include this stop id in the output (you may use this multiple times)',
+                        metavar = 'ID', action='append', dest = 'include_stops')
+    parser.add_argument('--exclude-stop',
+                        help = 'Exclude this stop id in the output (you may use this multiple times)',
+                        metavar = 'ID', action='append', dest = 'exclude_stops')
+    parser.add_argument('-r', '--include-route',
+                        help = 'Only include this route id in the output (you may use this multiple times)',
+                        metavar = 'ID', action='append', dest = 'include_routes')
+    parser.add_argument('--exclude-route',
+                        help = 'Exclude this route id in the output (you may use this multiple times)',
+                        metavar = 'ID', action='append', dest = 'exclude_routes')
+    parser.add_argument('-f', '--file',
+                        help = 'Save the ouput to this filename',
+                        metavar = 'FILE', action='store', dest = 'filename')
+    parser.add_argument('-d', '--date',
+                        help = 'Specify the date of the report to run in the format YYYY-MM-DD. Defaults to today',
+                        metavar = 'DATE', action='store', dest = 'date')
+    args = parser.parse_args()
+    
+    go(args)

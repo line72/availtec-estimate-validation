@@ -1,0 +1,256 @@
+#!/usr/bin/env python3
+
+##################################################
+# availtec-estimate-validation
+# (c) Marcus Dillavou <line72@line72.net
+#  https://github.com/line72/availtec-estimate-validation
+##################################################
+
+# MIT License
+#
+# Copyright (c) 2019 Marcus Dillavou <line72@line72.net>
+# https://github.com/line72/availtec-estimate-validation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+import config
+
+import sys
+import sqlite3
+import json
+import requests
+import time
+import re
+import datetime
+
+def go():
+    conn = sqlite3.connect('availtec-times.db')
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    create_db(conn, cursor)
+
+    while True:
+        for stop in config.stops:
+            try:
+                resp = requests.get(f'{config.URL}/rest/StopDepartures/GetPast/{stop["id"]}')
+                resp.raise_for_status()
+
+                for route in resp.json():
+                    for rd in route['RouteDirections']:
+                        # we get multiple departure times. Sometimes, two departure
+                        #  times are actually the same bus (because it is going to do
+                        #  a future run). This breaks our 'actual' time, because when
+                        #  the bus crosses the stop the first time, the actual gets
+                        #  set for a future run, which we don't want.
+                        # Therefore, we keep track of the captured vehicles and don't
+                        #  reuse them for later runs.
+                        captured_vehicles = []
+                        for departure in rd['Departures']:
+                            stop_id = stop['id']
+                            route_id = rd['RouteId']
+                            desciption = stop['description']
+                            trip_id = departure['Trip']['TripId']
+                            run_id = departure['Trip']['RunId']
+                            block_id = departure['Trip']['BlockFareboxId']
+                            direction = departure['Trip']['TripDirection']
+                            edt = parse_json_datetime(departure['EDT']) # convert to iso8601
+
+                            # try to look this up in the routes table
+                            cursor.execute("SELECT * FROM stop_routes where stop_id=? AND route_id=? AND trip_id=? AND run_id=? AND block_id=? AND date=date('now')",
+                                           (stop_id, route_id, trip_id, run_id, block_id))
+                            route_result = cursor.fetchone()
+                            if not route_result:
+                                #print(f'inserting stop_id={stop_id} route={route_id} trip={trip_id} run={run_id} block={block_id}')
+                                cursor.execute("INSERT INTO stop_routes (date, stop_id, name, route_id, trip_id, run_id, block_id) VALUES (date('now'), ?, ?, ?, ?, ?, ?)",
+                                               (stop_id, desciption, route_id, trip_id, run_id, block_id))
+                                conn.commit()
+                                cursor.execute("SELECT * FROM stop_routes where stop_id=? AND route_id=? AND trip_id=? AND run_id=? AND block_id=? AND date=date('now')",
+                                               (stop_id, route_id, trip_id, run_id, block_id))
+                                route_result = cursor.fetchone()
+
+                            # find the matching vehicle
+                            if block_id not in captured_vehicles:
+                                params = {'routeIds': [route_id]}
+                                resp = requests.get(f'{config.URL}/rest/Vehicles/GetAllVehiclesForRoutes', params=params)
+                                resp.raise_for_status()
+                                vehicles = resp.json()
+
+                                # find the vehicle based on the block id
+                                vehicle = None
+
+                                matches = list(filter(lambda v: v['BlockFareboxId'] == block_id and v['Direction'] == direction, vehicles))
+                                if len(matches) > 0:
+                                    vehicle = matches[0]
+
+                                if vehicle:
+                                    latitude = vehicle['Latitude']
+                                    longitude = vehicle['Longitude']
+
+                                    #print(f'inserting estimate {route_result["id"]} {edt} {latitude} {longitude}')
+                                    cursor.execute("INSERT INTO estimates (datetime, stop_route_id, estimate, latitude, longitude) VALUES (datetime('now'), ?, ?, ?, ?)",
+                                                   (route_result['id'], edt, latitude, longitude))
+                                    conn.commit()
+
+                                    # get the previous location
+                                    prev_location = get_previous_location(cursor, route_result['id'])
+                                    # if prev_location:
+                                    #     print(f'prev location={prev_location["latitude"]} {prev_location["longitude"]}')
+                                    # else:
+                                    #     print('no previous location')
+
+                                    if direction == stop['direction'] and prev_location:
+                                        p00 = (prev_location["latitude"], prev_location["longitude"])
+                                        p01 = (latitude, longitude)
+
+                                        # see if our two lines intersect
+                                        p10 = stop['hit_line'][0]
+                                        p11 = stop['hit_line'][1]
+                                        #print(f'checking intersection of ({p00}),({p01}) <-> ({p10}),({p11})')
+                                        if check_hit((p00, p01), (p10, p11)):
+                                            #print(f'Got a hit!')
+                                            # update the actual time for this stop_route!
+                                            cursor.execute("UPDATE stop_routes set actual=datetime('now') WHERE id=?", (route_result['id'],))
+                                            conn.commit()
+
+                            captured_vehicles.append(block_id)
+                        
+            except requests.exceptions.HTTPError as e:
+                print(f'Error fetching stop {stop["id"]}: {e}')
+            except Exception as e:
+                import traceback
+                tb = traceback.format_exc()
+                print(tb, file = sys.stderr)
+
+        time.sleep(30)
+
+    conn.close()
+
+def create_db(conn, cursor):
+    cursor.execute('''
+CREATE TABLE IF NOT EXISTS stop_routes (
+id INTEGER PRIMARY KEY AUTOINCREMENT,
+date TEXT,
+stop_id TEXT,
+name TEXT,
+route_id TEXT,
+trip_id TEXT,
+run_id TEXT,
+block_id TEXT,
+actual TEXT
+)
+    ''')
+
+    cursor.execute('''
+CREATE TABLE IF NOT EXISTS estimates (
+id INTEGER PRIMARY KEY AUTOINCREMENT, 
+datetime TEXT,
+stop_route_id INTEGER,
+estimate TEXT,
+latitude REAL,
+longitude REAL
+)
+    ''')
+
+    conn.commit()
+
+def get_previous_location(cursor, rid):
+    cursor.execute("SELECT * from estimates WHERE stop_route_id=? ORDER BY id DESC LIMIT 2", (rid,))
+    result = cursor.fetchall()
+    if len(result) > 1:
+        return result[1]
+    return None
+
+def orientation(p, q, r):
+    val = (q[1] - p[1]) * (r[0] - q[0]) - (q[0] - p[0]) * (r[1] - q[1])
+
+    if val == 0:
+        return 0
+    elif val > 0:
+        return 1
+    else:
+        return 2
+
+def on_segment(p, q, r):
+    if q[0] <= max(p[0], r[0]) and q[0] >= min(p[0], r[0]) and \
+       q[1] <= max(p[1], r[1]) and q[1] >= min(p[1], r[1]):
+        return True
+
+    return False
+    
+def check_hit(l0, l1):
+    (p1, q1) = l0
+    (p2, q2) = l1
+    
+    #!mwd - See:
+    # https://www.geeksforgeeks.org/check-if-two-given-line-segments-intersect/
+    
+    o1 = orientation(p1, q2, p2)
+    o2 = orientation(p1, q1, q2)
+    o3 = orientation(p2, q2, p1)
+    o4 = orientation(p2, q2, q1)
+
+    # general case
+    if o1 != o2 and o3 != o4:
+        return True
+
+    # special cases
+    # p1, q1, and p2 are colinear and p2 lies on segment p1q1
+    if o1 == 0 and on_segment(p1, p2, q2):
+        return True
+    
+    # p1, q1 and q2 are colinear and q2 lies on segment p1q1
+    if o2 == 0 and on_segment(p1, q2, q1):
+        return True
+
+    # p2, q2 and p1 are colinear and p1 lies on segment p2q2
+    if o3 == 0 and on_segment(p2, p1, q2):
+        return True
+
+    # p2, q2 and q1 are colinear and q1 lies on segment p2q2
+    if o4 == 0 and on_segment(p2, q1, q2):
+        return True
+
+    return False
+
+def parse_json_datetime(dt):
+    r = re.compile(r'/Date\(([-+]?\d+)([-+]\d+)?\)/')
+    
+    # "/Date(-62135575200000-0600)/" seems to be the default date returned
+    # if the value is null:
+    if dt == "/Date(-62135575200000-0600)/":
+        return None
+    else:
+        match = r.match(dt)
+        if match and len(match.groups()) > 0:
+            seconds_since_epoch = int(match.group(1)) / 1000
+            d = datetime.datetime.fromtimestamp(seconds_since_epoch)
+
+            if len(match.groups()) == 2:
+                t = match.group(2)
+                timezone = t[:3] + ':' + t[3:]
+
+                d2 = datetime.datetime.isoformat(d)
+                d = datetime.datetime.fromisoformat(d2 + timezone)
+
+                return d
+            return d
+        return None
+
+if __name__ == '__main__':
+    go()
