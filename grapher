@@ -116,7 +116,13 @@ def go(args):
         # explicitely set the y-ticks
         min_y = min(ys)
         max_y = max(ys)
-        yticks = [min_y, actual, max_y]
+        yticks = []
+        if actual - min_y >= datetime.timedelta(minutes = 1):
+            yticks.append(min_y)
+        yticks.append(actual)
+        if max_y - actual >= datetime.timedelta(minutes = 1):
+            yticks.append(max_y)
+
         plts[i].yaxis.set_ticks(yticks)
 
     filename = args.filename or 'output.pdf'
