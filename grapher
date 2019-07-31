@@ -55,9 +55,7 @@ def go(args):
     # This conversion is stupid. First, we have a naive datetime,
     #  so we set its timezone to utc, THEN we convert it to the local
     #  timezone and get just the date part.
-    print(f'before {len(stop_routes)}')
     stop_routes = list(filter(lambda x: datetime.datetime.fromisoformat(x['actual']).replace(tzinfo = datetime.timezone.utc).astimezone(datetime.timezone(datetime.timedelta(hours = LOCAL_TIMEZONE))).date() == date, stop_routes))
-    print(f'after {len(stop_routes)}')
     
     # filter or include based on command line args
     if args.include_stops:
