@@ -35,17 +35,30 @@ import sqlite3
 import datetime
 import matplotlib.pyplot
 
+LOCAL_TIMEZONE=-5 #local timezone offset from UTC
+
 def go(args):
     conn = sqlite3.connect('availtec-times.db')
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
 
-    date = args.date if args.date else datetime.date.today().strftime('%Y-%m-%d')
+    date_str = args.date if args.date else datetime.date.today().strftime('%Y-%m-%d')
+    date = datetime.datetime.fromisoformat(date_str).replace(tzinfo = datetime.timezone(datetime.timedelta(hours = LOCAL_TIMEZONE))).date() # timezones suck.
     
-    # only get results from today
-    cursor.execute("SELECT * FROM stop_routes WHERE actual IS NOT NULL AND date=date(?) ORDER BY NAME, route_id, actual, id", (date,))
+    # The date is in UTC. Since it doesn't have a time, if may be recorded for the wrong day
+    #  depending our our timezone. Therefore, get everything within +- 1 day, then filter later
+    #  based on the actual.
+    cursor.execute("SELECT * FROM stop_routes WHERE actual IS NOT NULL AND date >= date(?,'-1 day') AND date <= date(?,'+1 day') ORDER BY NAME, route_id, actual, id", (date_str, date_str))
     stop_routes = cursor.fetchall()
 
+    # filter based on actual time in our local timezone
+    # This conversion is stupid. First, we have a naive datetime,
+    #  so we set its timezone to utc, THEN we convert it to the local
+    #  timezone and get just the date part.
+    print(f'before {len(stop_routes)}')
+    stop_routes = list(filter(lambda x: datetime.datetime.fromisoformat(x['actual']).replace(tzinfo = datetime.timezone.utc).astimezone(datetime.timezone(datetime.timedelta(hours = LOCAL_TIMEZONE))).date() == date, stop_routes))
+    print(f'after {len(stop_routes)}')
+    
     # filter or include based on command line args
     if args.include_stops:
         stop_routes = list(filter(lambda x: x['stop_id'] in args.include_stops, stop_routes))
